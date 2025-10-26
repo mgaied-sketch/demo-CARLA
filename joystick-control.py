@@ -1,9 +1,9 @@
 import carla
 import pygame
-import time
 import os
 import sys
 import datetime
+import math
 
 def main():
     # Initialize pygame and joystick
@@ -77,11 +77,10 @@ def main():
     world = client.get_world()
     blueprint_library = world.get_blueprint_library()
     bp = blueprint_library.filter('vehicle.tesla.model3')[0]
-    spawn_point = world.get_map().get_spawn_points()[0]
+    spawn_point = world.get_map().get_spawn_points()[22]
     vehicle = world.spawn_actor(bp, spawn_point)
     actor_list = [vehicle]
-    current_gear = 1
-    prev_gear = current_gear
+    
 
 
     # buttons
@@ -97,25 +96,14 @@ def main():
     detect_button = 2
     detect = False
     # If True, pressing the throttle will automatically cancel reverse. Default False
-    throttle_exit_reverse = False
-
-    prev_axes = [0.0] * (joystick.get_numaxes() if joystick else 0)
-    prev_buttons_full = [0] * (joystick.get_numbuttons() if joystick else 0)
-    try:
-        prev_hats = [joystick.get_hat(i) for i in range(joystick.get_numhats())] if joystick else []
-    except Exception:
-        prev_hats = []
-
-    pedal_debug = True
-    pedal_debug_threshold = 0.05
+    throttle_exit_reverse = True
     prev_raw_throttle = None
     prev_raw_brake = None
-    prev_raw_clutch = None
-
+    prev_buttons = []
     # Per-axis inversion flags: flip mapping for axes that report opposite polarity
     invert_throttle = False
     invert_brake = False
-    invert_clutch = False
+    
 
     def _normalize_pedal(raw, invert=False):
         """Map raw axis value in [-1,1] to normalized [0,1].
@@ -148,36 +136,9 @@ def main():
             throttle = throttle_norm
             brake = _normalize_pedal(raw_brake, invert=invert_brake)
 
-            # pedal debug
-            if pedal_debug:
-                try:
-                    if prev_raw_throttle is None or abs(raw_throttle - prev_raw_throttle) > pedal_debug_threshold:
-                        print(f"pedal detected: throttle axis {throttle_axis} raw {raw_throttle:.3f} -> norm {throttle:.3f}")
-                        prev_raw_throttle = raw_throttle
-                    if prev_raw_brake is None or abs(raw_brake - prev_raw_brake) > pedal_debug_threshold:
-                        print(f"pedal detected: brake axis {brake_axis} raw {raw_brake:.3f} -> norm {brake:.3f}")
-                        prev_raw_brake = raw_brake
-                except Exception:
-                    pass
-
             # read buttons
             num_buttons = joystick.get_numbuttons() if joystick else 0
             buttons = [joystick.get_button(i) for i in range(num_buttons)] if joystick else []
-
-            # clutch
-            try:
-                raw_clutch = joystick.get_axis(clutch_axis) if joystick and clutch_axis is not None and clutch_axis < joystick.get_numaxes() else -1.0
-                clutch = _normalize_pedal(raw_clutch, invert=invert_clutch)
-            except Exception:
-                clutch = 0.0
-
-            if pedal_debug:
-                try:
-                    if prev_raw_clutch is None or abs(raw_clutch - prev_raw_clutch) > pedal_debug_threshold:
-                        print(f"pedal detected: clutch axis {clutch_axis} raw {raw_clutch:.3f} -> norm {clutch:.3f}")
-                        prev_raw_clutch = raw_clutch
-                except Exception:
-                    pass
 
             # Event-based reverse toggle: handle JOYBUTTONDOWN from any device
             for ev in pygame.event.get():
@@ -214,17 +175,21 @@ def main():
             except Exception:
                 speed = 0.0
 
-            # If reverse was requested, brake the vehicle until it's (nearly) stopped, then engage reverse
+            # Handle reverse pending -> engage reverse when vehicle stops
+            if reverse_pending and speed < 0.5:  # vehicle nearly stopped
+                reverse_mode = True
+                reverse_pending = False
+                print("debug: reverse engaged (vehicle stopped)")
+            elif reverse_pending and throttle > 0.1:
+                # Cancel reverse request if throttle is pressed while braking to stop
+                reverse_pending = False
+                print("debug: reverse request cancelled (throttle pressed)")
+
+            # Auto-brake when reverse is pending to bring vehicle to stop
             if reverse_pending:
-                # apply an aggressive brake request to encourage stopping
-                if speed > 0.5:
-                    print(f"debug: reverse pending, braking (speed={speed:.3f})")
-                    brake = max(brake, 1.0)
-                    throttle = 0.0
-                else:
-                    reverse_mode = True
-                    reverse_pending = False
-                    print("debug: reverse engaged after stopping")
+                brake = max(brake, 0.5)  # Apply minimum brake to stop vehicle
+                throttle = 0.0  # Disable throttle while stopping for reverse
+                print(f"debug: auto-braking for reverse (speed={speed:.2f})")
 
             # keep throttle inversion in sync with reverse state
             invert_throttle = bool(reverse_mode)
@@ -235,20 +200,22 @@ def main():
             except Exception:
                 throttle = throttle_norm
 
-            # set logical current_gear for diagnostics (automatic transmission is used)
-            current_gear = -1 if reverse_mode else 1
+            # Apply safety limits and smoothing
+            throttle = max(0.0, min(1.0, throttle))  # Clamp throttle to [0,1]
+            brake = max(0.0, min(1.0, brake))        # Clamp brake to [0,1]
+            
+            # Prevent simultaneous throttle and brake (safety feature)
+            if throttle > 0.1 and brake > 0.1:
+                if throttle > brake:
+                    brake = 0.0
+                else:
+                    throttle = 0.0
+
             # If configured, pressing throttle can cancel reverse (optional; disabled by default)
             if throttle_exit_reverse and reverse_mode and throttle > 0.1:
                 reverse_mode = False
+                reverse_pending = False
                 print("debug: throttle exited reverse (throttle_exit_reverse enabled)")
-
-            # gear changed
-            try:
-                if current_gear != prev_gear:
-                    print(f"gear changed -> {current_gear}")
-                    prev_gear = current_gear
-            except Exception:
-                pass
 
             # apply control
             control = carla.VehicleControl()
@@ -256,38 +223,8 @@ def main():
             control.throttle = throttle
             control.brake = brake
             control.hand_brake = hand_brake
-            # Use automatic transmission so throttle/brake control is enough.
-            # This disables manual gearbox forcing inside CARLA and lets reverse
-            # be applied via the reverse flag/gear value.
+            control.reverse = reverse_mode
             control.manual_gear_shift = False
-            # Some control schemes expect the gear sign to indicate direction
-            # (negative gear -> reverse). Set gear signed when reverse is active
-            # and also keep the reverse flag in sync for compatibility.
-            try:
-                g = int(current_gear)
-            except Exception:
-                g = 1
-            if g == 0:
-                g = 1
-            if current_gear < 0:
-                control.gear = -abs(g)
-                control.reverse = True
-            else:
-                control.gear = abs(g)
-                control.reverse = False
-            # Experimental debug: if debug mode is enabled and reverse is active,
-            # force a small throttle and disable manual_gear_shift so we can test
-            # whether CARLA will move the vehicle backwards when reverse=True.
-            # Toggle debug with the configured debug button in-game.
-            if debug and control.reverse:
-                try:
-                    print("DEBUG-FORCE: applying experimental reverse throttle (manual_gear_shift->False, throttle=0.25)")
-                    control.manual_gear_shift = False
-                    control.throttle = max(control.throttle, 0.25)
-                    # ensure gear is set to a sane positive value while using reverse flag
-                    control.gear = 1
-                except Exception:
-                    pass
 
             # Debug: print control being sent to CARLA and current vehicle velocity
             try:
@@ -320,7 +257,7 @@ def main():
             v_rot = vehicle_transform.rotation
             behind_distance = 8.0
             height_offset = 3.0
-            import math
+            
             yaw_rad = math.radians(v_rot.yaw)
             dx = -behind_distance * math.cos(yaw_rad)
             dy = -behind_distance * math.sin(yaw_rad)
@@ -351,30 +288,9 @@ def main():
             # debug prints
             if debug:
                 try:
-                    print(f"steer={steer:.3f} throttle={throttle:.3f} brake={brake:.3f} clutch={clutch:.3f} gear={current_gear} hand_brake={hand_brake}")
+                    print(f"steer={steer:.3f} throttle={throttle:.3f} brake={brake:.3f} hand_brake={hand_brake}")
                     print(f"axes={[round(joystick.get_axis(i),3) for i in range(joystick.get_numaxes())]}")
                     print(f"buttons={[joystick.get_button(i) for i in range(joystick.get_numbuttons())]}")
-                except Exception:
-                    pass
-
-            # detect mode
-            if detect:
-                try:
-                    for i in range(joystick.get_numaxes()):
-                        a = joystick.get_axis(i)
-                        if i >= len(prev_axes) or abs(a - prev_axes[i]) > 0.01:
-                            print(f"axis[{i}] changed -> {a:.3f}")
-                    for i in range(joystick.get_numbuttons()):
-                        b = joystick.get_button(i)
-                        if i >= len(prev_buttons_full) or b != prev_buttons_full[i]:
-                            print(f"button[{i}] changed -> {b}")
-                    for i in range(joystick.get_numhats()):
-                        h = joystick.get_hat(i)
-                        if i >= len(prev_hats) or h != prev_hats[i]:
-                            print(f"hat[{i}] changed -> {h}")
-                    prev_axes = [joystick.get_axis(i) for i in range(joystick.get_numaxes())]
-                    prev_buttons_full = [joystick.get_button(i) for i in range(joystick.get_numbuttons())]
-                    prev_hats = [joystick.get_hat(i) for i in range(joystick.get_numhats())]
                 except Exception:
                     pass
     except KeyboardInterrupt:
