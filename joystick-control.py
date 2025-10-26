@@ -97,8 +97,6 @@ def main():
     detect = False
     # If True, pressing the throttle will automatically cancel reverse. Default False
     throttle_exit_reverse = True
-    prev_raw_throttle = None
-    prev_raw_brake = None
     prev_buttons = []
     # Per-axis inversion flags: flip mapping for axes that report opposite polarity
     invert_throttle = False
@@ -180,18 +178,18 @@ def main():
                 reverse_mode = True
                 reverse_pending = False
                 print("debug: reverse engaged (vehicle stopped)")
-            elif reverse_pending and throttle > 0.1:
-                # Cancel reverse request if throttle is pressed while braking to stop
+            elif throttle_norm > 0.1 and reverse_pending:
+                reverse_mode = False
                 reverse_pending = False
                 print("debug: reverse request cancelled (throttle pressed)")
 
             # Auto-brake when reverse is pending to bring vehicle to stop
             if reverse_pending:
-                brake = max(brake, 0.5)  # Apply minimum brake to stop vehicle
+                brake = max(brake, 0.8)  # Apply stronger brake to stop vehicle quickly
                 throttle = 0.0  # Disable throttle while stopping for reverse
                 print(f"debug: auto-braking for reverse (speed={speed:.2f})")
 
-            # keep throttle inversion in sync with reverse state
+            # Use normalized throttle directly (no inversion needed for reverse)
             invert_throttle = bool(reverse_mode)
 
             # apply inversion to the already-normalized throttle value
@@ -199,20 +197,9 @@ def main():
                 throttle = 1.0 - throttle_norm if invert_throttle else throttle_norm
             except Exception:
                 throttle = throttle_norm
-
-            # Apply safety limits and smoothing
-            throttle = max(0.0, min(1.0, throttle))  # Clamp throttle to [0,1]
-            brake = max(0.0, min(1.0, brake))        # Clamp brake to [0,1]
             
-            # Prevent simultaneous throttle and brake (safety feature)
-            if throttle > 0.1 and brake > 0.1:
-                if throttle > brake:
-                    brake = 0.0
-                else:
-                    throttle = 0.0
-
-            # If configured, pressing throttle can cancel reverse (optional; disabled by default)
-            if throttle_exit_reverse and reverse_mode and throttle > 0.1:
+            # If configured, pressing throttle can cancel reverse (check before any modifications)
+            if throttle_exit_reverse and reverse_mode and throttle_norm > 0.1:
                 reverse_mode = False
                 reverse_pending = False
                 print("debug: throttle exited reverse (throttle_exit_reverse enabled)")
@@ -224,11 +211,12 @@ def main():
             control.brake = brake
             control.hand_brake = hand_brake
             control.reverse = reverse_mode
-            control.manual_gear_shift = False
+            control.manual_gear_shift = False  # Keep automatic transmission
 
             # Debug: print control being sent to CARLA and current vehicle velocity
             try:
                 print(f"CONTROL-> reverse={control.reverse} gear={control.gear} throttle={control.throttle:.3f} brake={control.brake:.3f} manual_shift={control.manual_gear_shift}")
+                print(f"STATE-> reverse_mode={reverse_mode} reverse_pending={reverse_pending}")
                 v = vehicle.get_velocity()
                 speed = (v.x ** 2 + v.y ** 2 + v.z ** 2) ** 0.5
                 print(f"VEHICLE-> speed={speed:.3f} vel=({v.x:.3f},{v.y:.3f},{v.z:.3f})")
